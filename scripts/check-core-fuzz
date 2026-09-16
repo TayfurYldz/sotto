@@ -332,12 +332,19 @@ def main(argv=None):
     output = ROOT / "target" / "core-fuzz" / f"{args.target}-{uuid.uuid4().hex}"
     output.mkdir(parents=True)
     evidence_path = output / "run.json"
+    evidence = new_evidence(args.profile, args.target, output, args.sanitizer, None, args.corpus)
     try:
         rng_seed = resolve_seed(args.profile, args.seed)
     except CampaignError as error:
+        evidence["outcome"] = "seed_validation_failure"
+        evidence["error"] = str(error)
         print(f"core fuzz failed: {error}", file=sys.stderr)
+        try:
+            write_evidence(evidence_path, evidence)
+        except OSError as write_error:
+            print(f"core fuzz evidence write failed: {write_error}", file=sys.stderr)
         return 1
-    evidence = new_evidence(args.profile, args.target, output, args.sanitizer, rng_seed, args.corpus)
+    evidence["rng_seed"] = rng_seed
     try:
         write_evidence(evidence_path, evidence)
         evidence["rustc_version"] = ensure_pins()

@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -284,6 +285,36 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaises(runner.CampaignError):
                     runner.run_campaign("pr", "base32_codec", output, evidence, "none")
             self.assertEqual(evidence["outcome"], "assertion_failure")
+
+    def _assert_seed_validation_failure(self, extra_args, env_seed, suffix, error_text):
+        output = ROOT / "target" / "core-fuzz" / f"base32_codec-{suffix}"
+        shutil.rmtree(output, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, output, True)
+        argv = ["--profile", "pr", "--target", "base32_codec", *extra_args]
+        with patch.object(runner.uuid, "uuid4", return_value=SimpleNamespace(hex=suffix)), patch.dict(
+            runner.os.environ, {"CORE_FUZZ_SEED": env_seed}
+        ), patch.object(runner, "ensure_pins") as ensure_pins, patch.object(runner, "run_campaign") as run_campaign:
+            self.assertEqual(runner.main(argv), 1)
+        ensure_pins.assert_not_called()
+        run_campaign.assert_not_called()
+        evidence = json.loads((output / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(evidence["profile"], "pr")
+        self.assertEqual(evidence["target"], "base32_codec")
+        self.assertEqual(evidence["status"], "failed")
+        self.assertEqual(evidence["outcome"], "seed_validation_failure")
+        self.assertIsNone(evidence["rng_seed"])
+        self.assertIn(error_text, evidence["error"])
+        self.assertNotIn("command", evidence)
+        self.assertNotIn("rustc_version", evidence)
+
+    def test_zero_seed_writes_failed_evidence_without_starting_campaign(self):
+        self._assert_seed_validation_failure(["--seed", "0"], "123", "seedzero", "between 1 and")
+
+    def test_negative_seed_writes_failed_evidence_without_starting_campaign(self):
+        self._assert_seed_validation_failure(["--seed", "-7"], "123", "seednegative", "between 1 and")
+
+    def test_malformed_environment_seed_writes_failed_evidence_without_starting_campaign(self):
+        self._assert_seed_validation_failure([], "not-an-integer", "seedenvironment", "must be an integer")
 
     def test_failed_final_evidence_write_does_not_pass(self):
         writes = 0
