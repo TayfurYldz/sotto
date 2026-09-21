@@ -13,8 +13,8 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    abort_and_join, join_with_timeout, receive_pid, transaction_pid, wait_for_specific_block,
-    RaceTaskGuard,
+    receive_owned, receive_pid, run_with_teardown, transaction_pid, wait_for_specific_block,
+    RaceTaskOwner, RACE_TIMEOUT,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -57,26 +57,33 @@ impl Fixture {
 }
 
 async fn cleanup(fixture: &Fixture) {
+    cleanup_result(fixture)
+        .await
+        .expect("delete coverage test fixture");
+}
+
+async fn cleanup_result(fixture: &Fixture) -> Result<(), String> {
     sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
         .await
-        .expect("delete coverage head");
+        .map_err(|error| format!("delete coverage head: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
         .await
-        .expect("delete coverage facts");
+        .map_err(|error| format!("delete coverage facts: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
         .await
-        .expect("delete coverage revisions");
+        .map_err(|error| format!("delete coverage revisions: {error}"))?;
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(&fixture.pool)
         .await
-        .expect("delete coverage test user");
+        .map_err(|error| format!("delete coverage test user: {error}"))?;
+    Ok(())
 }
 
 fn paid(id: &str, source: &str, starts_at: i64, paid_until: i64) -> ConfirmedPaidInterval {
@@ -348,7 +355,8 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
     let holder_beneficiary = fixture.beneficiary_id.clone();
     let holder_projection = winning_projection.clone();
     let holder_release = release.clone();
-    let mut holder = Some(tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(async move {
         let mut tx = holder_pool.begin().await.expect("begin held correction");
         let pid = transaction_pid(&mut tx).await;
         let result = publish(
@@ -373,14 +381,12 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
             }
         }
     }));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(holder.as_ref().expect("holder task is registered"));
     let holder_pid = receive_pid(holder_ready_rx, "receive correction holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_beneficiary = fixture.beneficiary_id.clone();
-    let mut waiter = Some(tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool.begin().await.expect("begin waiting correction");
         let pid = transaction_pid(&mut tx).await;
         waiter_ready.send(pid).expect("signal waiting correction");
@@ -396,15 +402,18 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
         tx.rollback().await.expect("rollback waiting correction");
         result
     }));
-    tasks.watch(waiter.as_ref().expect("waiter task is registered"));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive correction waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let winner = join_with_timeout(&mut holder, "held correction")
+    let winner = receive_owned(&mut holder, "held correction")
         .await
+        .expect("held correction task completed")
         .expect("winning correction applied");
-    let loser = join_with_timeout(&mut waiter, "waiting correction").await;
+    let loser = receive_owned(&mut waiter, "waiting correction")
+        .await
+        .expect("waiting correction task completed");
+    owner.join_all().await.expect("join correction tasks");
     assert_eq!(winner.outcome, PublicationOutcome::Applied);
     assert_eq!(winner.revision, 2);
     assert!(matches!(
@@ -476,7 +485,8 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
     let (ready, ready_rx) = oneshot::channel();
     let pool = fixture.pool.clone();
     let beneficiary_id = fixture.beneficiary_id.clone();
-    let mut task = Some(tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let _task = owner.spawn(async move {
         let mut tx = pool.begin().await.expect("begin owned publication");
         publish(
             &mut tx,
@@ -492,12 +502,15 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
         .expect("publish owned publication");
         ready.send(()).expect("signal owned publication");
         std::future::pending::<()>().await;
-    }));
+    });
     tokio::time::timeout(support::coverage_concurrency::RACE_TIMEOUT, ready_rx)
         .await
         .expect("owned publication became ready")
         .expect("owned publication task exited before readiness");
-    abort_and_join(&mut task, "owned publication").await;
+    owner
+        .abort_and_join()
+        .await
+        .expect("drain owned publication task");
 
     let receipt = tokio::time::timeout(
         support::coverage_concurrency::RACE_TIMEOUT,
@@ -527,6 +540,80 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
         .expect("load unrelated fixture after cleanup");
     assert_eq!(unrelated_loaded.revision, 1);
     cleanup(&fixture).await;
+    cleanup(&unrelated).await;
+}
+
+#[tokio::test]
+async fn scenario_panic_cleans_owned_publication_fixture() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let unrelated = Fixture::create()
+        .await
+        .expect("create unrelated cleanup fixture");
+    committed_publish(
+        &unrelated,
+        None,
+        "unrelated-publication",
+        "unrelated-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![],
+        },
+    )
+    .await
+    .expect("publish unrelated fixture");
+
+    let (ready, ready_rx) = oneshot::channel();
+    let pool = fixture.pool.clone();
+    let beneficiary_id = fixture.beneficiary_id.clone();
+    let mut owner = RaceTaskOwner::new();
+    let _task = owner.spawn(async move {
+        let mut tx = pool.begin().await.expect("begin panic fixture publication");
+        publish(
+            &mut tx,
+            &beneficiary_id,
+            None,
+            "panic-publication",
+            "panic-evidence",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        )
+        .await
+        .expect("publish panic fixture");
+        ready.send(()).expect("signal panic fixture readiness");
+        std::future::pending::<()>().await;
+    });
+
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            tokio::time::timeout(RACE_TIMEOUT, ready_rx)
+                .await
+                .map_err(|_| "timed out waiting for panic fixture".to_string())
+                .and_then(|result| {
+                    result.map_err(|_| "panic fixture task exited before readiness".to_string())
+                })?;
+            panic!("intentional scenario failure");
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
+        },
+        || async { cleanup_result(&fixture).await },
+    )
+    .await;
+    assert_eq!(result, Err("scenario: scenario panicked".into()));
+
+    let remaining_user: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(&fixture.beneficiary_id)
+        .fetch_optional(&fixture.pool)
+        .await
+        .expect("check panic fixture cleanup");
+    assert!(remaining_user.is_none());
+    let unrelated_loaded = load(&unrelated.pool, &unrelated.beneficiary_id)
+        .await
+        .expect("load unrelated fixture after panic cleanup");
+    assert_eq!(unrelated_loaded.revision, 1);
+
     cleanup(&unrelated).await;
 }
 
