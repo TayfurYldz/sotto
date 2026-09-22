@@ -18,8 +18,8 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    receive_owned, receive_pid, run_with_context, transaction_pid, wait_for_specific_block,
-    RaceTaskOwner,
+    receive_owned, receive_pid, run_with_context, run_with_teardown, transaction_pid,
+    wait_for_specific_block, RaceTaskOwner,
 };
 
 struct Fixture {
@@ -292,6 +292,486 @@ async fn corrupt_generation(
     .execute(&fixture.pool)
     .await
     .expect("corrupt stored source generation");
+}
+
+async fn try_set_bindings(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    raw: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET source_bindings = $3::jsonb \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(raw)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+fn assert_sqlstate(error: &sqlx::Error, code: &str) {
+    match error {
+        sqlx::Error::Database(database) => {
+            assert_eq!(database.code().as_deref(), Some(code));
+        }
+        other => panic!("expected database error with SQLSTATE {code}, got {other:?}"),
+    }
+}
+
+async fn complete(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    aggregate_evidence_reference: &str,
+    observations: &[SourceObservation],
+) -> sotto_server::cloud_coverage_reconciliation::ReconciliationReceipt {
+    let mut tx = fixture.pool.begin().await.expect("begin completion");
+    let receipt = finish_collection(&mut tx, ticket, aggregate_evidence_reference, observations)
+        .await
+        .expect("finish collection");
+    tx.commit().await.expect("commit completion");
+    receipt
+}
+
+async fn committed_begin(
+    fixture: &Fixture,
+    attempt_id: &str,
+) -> Result<sotto_server::cloud_coverage_reconciliation::CollectionTicket, ReconciliationError> {
+    let mut tx = fixture.pool.begin().await.expect("begin stored replay");
+    let result = begin_collection(&mut tx, &fixture.beneficiary_id, attempt_id).await;
+    tx.commit().await.expect("commit stored replay");
+    result
+}
+
+async fn committed_finish(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    aggregate_evidence_reference: &str,
+    observations: &[SourceObservation],
+) -> Result<sotto_server::cloud_coverage_reconciliation::ReconciliationReceipt, ReconciliationError>
+{
+    let mut tx = fixture.pool.begin().await.expect("begin stored finish");
+    let result =
+        finish_collection(&mut tx, ticket, aggregate_evidence_reference, observations).await;
+    tx.commit().await.expect("commit stored finish");
+    result
+}
+
+async fn attempt_identity(
+    fixture: &Fixture,
+    attempt_id: &str,
+) -> (String, i64, i64, Option<i64>, String) {
+    sqlx::query_as(
+        "SELECT attempt_id, collection_epoch, source_set_generation, \
+                expected_projection_revision, status \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read attempt identity")
+}
+
+async fn assert_attempt_status(fixture: &Fixture, attempt_id: &str, status: &str) {
+    assert_eq!(attempt_identity(fixture, attempt_id).await.4, status);
+}
+
+async fn registration_operations(fixture: &Fixture) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT source_id, registration_operation_id FROM cloud_coverage_sources \
+         WHERE beneficiary_id = $1 ORDER BY source_id",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read registration operations")
+}
+
+async fn stored_bindings_text(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+) -> String {
+    sqlx::query_scalar(
+        "SELECT source_bindings::text FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read stored bindings")
+}
+
+async fn register_pair(fixture: &Fixture, label: &str) -> (SourceBinding, SourceBinding) {
+    let first = binding(
+        fixture,
+        &format!("{label}-source-a"),
+        &format!("{label}-allocation-a"),
+    );
+    let second = binding(
+        fixture,
+        &format!("{label}-source-b"),
+        &format!("{label}-allocation-b"),
+    );
+    register(fixture, &first, &format!("{label}-registration-a")).await;
+    register(fixture, &second, &format!("{label}-registration-b")).await;
+    (first, second)
+}
+
+fn complete_observation(
+    source_id: &str,
+    evidence_reference: &str,
+    coverage_id: &str,
+) -> SourceObservation {
+    SourceObservation::Complete {
+        source_id: source_id.into(),
+        evidence_reference: evidence_reference.into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: coverage_id.into(),
+            source_id: source_id.into(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    }
+}
+
+fn changed_observation(source_id: &str) -> SourceObservation {
+    SourceObservation::Unavailable {
+        source_id: source_id.into(),
+        evidence_reference: "changed-source-evidence".into(),
+        reason: UnavailableReason::ConflictingEvidence,
+    }
+}
+
+async fn try_set_receipt(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    evidence: Option<&str>,
+    result: Option<&str>,
+    revision: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET aggregate_evidence_reference = $3, \
+                canonical_result = $4::jsonb, projection_revision = $5 \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(evidence)
+    .bind(result)
+    .bind(revision)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+async fn try_set_result(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    raw: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET canonical_result = $3::jsonb \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(raw)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+async fn try_set_evidence(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    evidence: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET aggregate_evidence_reference = $3 \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(evidence)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+async fn try_set_revision(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    revision: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET projection_revision = $3 \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(revision)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+async fn read_receipt_columns(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+) -> (Option<String>, Option<String>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT aggregate_evidence_reference, canonical_result::text, projection_revision \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read receipt columns")
+}
+
+async fn stored_result_json(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+) -> serde_json::Value {
+    let text: String = sqlx::query_scalar(
+        "SELECT canonical_result::text FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read stored canonical result");
+    serde_json::from_str(&text).expect("parse stored canonical result")
+}
+
+async fn setup_completed_attempt(
+    fixture: &Fixture,
+    label: &str,
+) -> (
+    sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    Vec<SourceObservation>,
+    String,
+    SourceBinding,
+) {
+    let source = binding(
+        fixture,
+        &format!("{label}-source"),
+        &format!("{label}-allocation"),
+    );
+    register(fixture, &source, &format!("{label}-registration")).await;
+    let ticket = begin(fixture, &attempt_id(fixture, &format!("{label}-attempt"))).await;
+    let observations = vec![complete_observation(
+        &source.source_id,
+        &format!("{label}-evidence"),
+        &format!("{label}-coverage"),
+    )];
+    let evidence = format!("{label}-aggregate");
+    complete(fixture, &ticket, &evidence, &observations).await;
+    (ticket, observations, evidence, source)
+}
+
+async fn setup_completed_pair(
+    fixture: &Fixture,
+    label: &str,
+) -> (
+    sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    Vec<SourceObservation>,
+    String,
+    SourceBinding,
+    SourceBinding,
+) {
+    let (first, second) = register_pair(fixture, label).await;
+    let ticket = begin(fixture, &attempt_id(fixture, &format!("{label}-attempt"))).await;
+    let observations = vec![
+        complete_observation(
+            &first.source_id,
+            &format!("{label}-evidence-a"),
+            &format!("{label}-coverage-a"),
+        ),
+        complete_observation(
+            &second.source_id,
+            &format!("{label}-evidence-b"),
+            &format!("{label}-coverage-b"),
+        ),
+    ];
+    let evidence = format!("{label}-aggregate");
+    complete(fixture, &ticket, &evidence, &observations).await;
+    (ticket, observations, evidence, first, second)
+}
+
+type CoordinatorRow = (i64, i64, Option<String>, String);
+type SourceRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    String,
+);
+type AttemptRow = (
+    String,
+    i64,
+    i64,
+    Option<i64>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    String,
+    Option<String>,
+);
+type RevisionRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<i64>,
+    String,
+);
+type FactRow = (i64, String, String, i64, i64, Option<String>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct DurableSnapshot {
+    coordinator: Option<CoordinatorRow>,
+    sources: Vec<SourceRow>,
+    attempts: Vec<AttemptRow>,
+    head: Option<i64>,
+    revisions: Vec<RevisionRow>,
+    facts: Vec<FactRow>,
+}
+
+async fn durable_snapshot(fixture: &Fixture) -> DurableSnapshot {
+    let coordinator = sqlx::query_as(
+        "SELECT source_set_generation, collection_epoch, current_attempt_id, \
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_optional(&fixture.pool)
+    .await
+    .expect("snapshot coordinator");
+    let sources = sqlx::query_as(
+        "SELECT source_id, beneficiary_id, provider_namespace, external_allocation_reference, \
+                ownership_evidence_reference, registration_operation_id, \
+                registration_source_set_generation, registration_projection_revision, \
+                to_char(registered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+         FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("snapshot sources");
+    let attempts = sqlx::query_as(
+        "SELECT attempt_id, collection_epoch, source_set_generation, \
+                expected_projection_revision, source_bindings::text, status, \
+                aggregate_evidence_reference, canonical_result::text, projection_revision, \
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), \
+                to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 \
+         ORDER BY collection_epoch",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("snapshot attempts");
+    let head = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_optional(&fixture.pool)
+    .await
+    .expect("snapshot head");
+    let revisions = sqlx::query_as(
+        "SELECT revision, operation_id, evidence_reference, status, unavailable_reason, fact_count, \
+                expected_revision, \
+                to_char(recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+         FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("snapshot revisions");
+    let facts = sqlx::query_as(
+        "SELECT revision, coverage_id, source_id, starts_at, paid_until, failed_renewal_id \
+         FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 \
+         ORDER BY revision, coverage_id",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("snapshot facts");
+    DurableSnapshot {
+        coordinator,
+        sources,
+        attempts,
+        head,
+        revisions,
+        facts,
+    }
+}
+
+async fn user_present(fixture: &Fixture) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+        .bind(&fixture.beneficiary_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("check user row")
+}
+
+async fn complete_unrelated_operation(unrelated: &Fixture) {
+    let source = binding(unrelated, "progress-source", "progress-allocation");
+    register(unrelated, &source, "progress-registration").await;
+    let ticket = begin(unrelated, &attempt_id(unrelated, "progress-attempt")).await;
+    let observations = vec![complete_observation(
+        &source.source_id,
+        "progress-evidence",
+        "progress-coverage",
+    )];
+    let receipt = complete(unrelated, &ticket, "progress-aggregate", &observations).await;
+    assert_eq!(receipt.outcome, PublicationOutcome::Applied);
+    let loaded = load(&unrelated.pool, &unrelated.beneficiary_id)
+        .await
+        .expect("load unrelated projection");
+    assert_eq!(loaded.revision, receipt.revision);
+}
+
+async fn coordinator_generation(fixture: &Fixture) -> i64 {
+    sqlx::query_scalar(
+        "SELECT source_set_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read source generation")
+}
+
+async fn assert_scoped_cleanup(
+    fixture: &Fixture,
+    unrelated: &Fixture,
+    bystander: &Fixture,
+    bystander_before: &DurableSnapshot,
+) {
+    assert_no_beneficiary_rows(fixture).await;
+    assert_no_beneficiary_rows(unrelated).await;
+    assert!(!user_present(fixture).await);
+    assert!(!user_present(unrelated).await);
+    assert!(user_present(bystander).await);
+    assert_eq!(&durable_snapshot(bystander).await, bystander_before);
+    cleanup(bystander).await;
+    assert_no_beneficiary_rows(bystander).await;
+    assert!(!user_present(bystander).await);
 }
 
 async fn head_revision(fixture: &Fixture) -> i64 {
@@ -747,6 +1227,4796 @@ async fn corrupt_completed_result_fails_before_classifying_a_changed_replay() {
     ));
     assert_eq!(head_revision(&fixture).await, original_head);
     cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn stored_empty_bindings_reject_completed_replay_as_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "empty-source", "empty-allocation");
+            register(&fixture, &source, "empty-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "empty-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "empty-evidence",
+                "empty-coverage",
+            )];
+            complete(&fixture, &completed, "empty-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "empty-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, serde_json::json!([])).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                let operations_before = registration_operations(&fixture).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+                assert_eq!(registration_operations(&fixture).await, operations_before);
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised empty bindings case");
+}
+
+#[tokio::test]
+async fn stored_non_object_binding_elements_are_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "element-source", "element-allocation");
+            register(&fixture, &source, "element-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "element-evidence",
+                "element-coverage",
+            )];
+            for (index, element) in ["1", "\"x\"", "null", "true"].iter().enumerate() {
+                let completed = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("element-completed-{index}")),
+                )
+                .await;
+                complete(
+                    &fixture,
+                    &completed,
+                    &format!("element-aggregate-{index}"),
+                    &observations,
+                )
+                .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("element-pending-{index}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+                let bindings: serde_json::Value =
+                    serde_json::from_str(&format!("[{element}]")).expect("build element bindings");
+                for ticket in [&pending, &completed] {
+                    corrupt_bindings(&fixture, ticket, bindings.clone()).await;
+                    let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                    assert!(matches!(
+                        committed_begin(&fixture, &ticket.attempt_id).await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingShape
+                        ))
+                    ));
+                    assert!(matches!(
+                        committed_finish(
+                            &fixture,
+                            ticket,
+                            "changed-aggregate",
+                            &[changed_observation(&source.source_id)],
+                        )
+                        .await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingShape
+                        ))
+                    ));
+                    assert_eq!(
+                        attempt_identity(&fixture, &ticket.attempt_id).await,
+                        identity_before
+                    );
+                }
+            }
+            assert_eq!(
+                registration_operations(&fixture).await.len(),
+                1,
+                "element cases preserve the single registration"
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised binding element case");
+}
+
+#[tokio::test]
+async fn stored_binding_missing_field_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "missing-source", "missing-allocation");
+            register(&fixture, &source, "missing-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "missing-evidence",
+                "missing-coverage",
+            )];
+            let stored = serde_json::to_value(&source).expect("serialize binding");
+            for missing in ["source_id", "beneficiary_id"] {
+                let mut object = stored
+                    .as_object()
+                    .expect("binding serializes to object")
+                    .clone();
+                object.remove(missing);
+                let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
+                let completed = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("missing-completed-{missing}")),
+                )
+                .await;
+                complete(
+                    &fixture,
+                    &completed,
+                    &format!("missing-aggregate-{missing}"),
+                    &observations,
+                )
+                .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("missing-pending-{missing}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+                for ticket in [&pending, &completed] {
+                    corrupt_bindings(&fixture, ticket, bindings.clone()).await;
+                    let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                    assert!(matches!(
+                        committed_begin(&fixture, &ticket.attempt_id).await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingShape
+                        ))
+                    ));
+                    assert!(matches!(
+                        committed_finish(
+                            &fixture,
+                            ticket,
+                            "changed-aggregate",
+                            &[changed_observation(&source.source_id)],
+                        )
+                        .await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingShape
+                        ))
+                    ));
+                    assert_eq!(
+                        attempt_identity(&fixture, &ticket.attempt_id).await,
+                        identity_before
+                    );
+                }
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised missing binding field case");
+}
+
+#[tokio::test]
+async fn stored_binding_wrong_field_type_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "type-source", "type-allocation");
+            register(&fixture, &source, "type-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "type-evidence",
+                "type-coverage",
+            )];
+            let stored = serde_json::to_value(&source).expect("serialize binding");
+            let cases = [
+                ("number", "source_id", serde_json::json!(42)),
+                (
+                    "null",
+                    "ownership_evidence_reference",
+                    serde_json::Value::Null,
+                ),
+            ];
+            for (label, field, value) in cases {
+                let mut object = stored
+                    .as_object()
+                    .expect("binding serializes to object")
+                    .clone();
+                object.insert(field.into(), value);
+                let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
+                let completed = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("type-completed-{label}")),
+                )
+                .await;
+                complete(
+                    &fixture,
+                    &completed,
+                    &format!("type-aggregate-{label}"),
+                    &observations,
+                )
+                .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("type-pending-{label}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+                for ticket in [&pending, &completed] {
+                    corrupt_bindings(&fixture, ticket, bindings.clone()).await;
+                    let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                    assert!(matches!(
+                        committed_begin(&fixture, &ticket.attempt_id).await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingShape
+                        ))
+                    ));
+                    assert!(matches!(
+                        committed_finish(
+                            &fixture,
+                            ticket,
+                            "changed-aggregate",
+                            &[changed_observation(&source.source_id)],
+                        )
+                        .await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingShape
+                        ))
+                    ));
+                    assert_eq!(
+                        attempt_identity(&fixture, &ticket.attempt_id).await,
+                        identity_before
+                    );
+                }
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised binding type case");
+}
+
+#[tokio::test]
+async fn stored_binding_blank_identifier_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "blank-source", "blank-allocation");
+            register(&fixture, &source, "blank-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "blank-evidence",
+                "blank-coverage",
+            )];
+            let stored = serde_json::to_value(&source).expect("serialize binding");
+            for (label, field, blank) in [
+                ("whitespace-source", "source_id", "  "),
+                ("empty-provider", "provider_namespace", ""),
+            ] {
+                let mut object = stored
+                    .as_object()
+                    .expect("binding serializes to object")
+                    .clone();
+                object.insert(field.into(), serde_json::json!(blank));
+                let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
+                let completed = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("blank-completed-{label}")),
+                )
+                .await;
+                complete(
+                    &fixture,
+                    &completed,
+                    &format!("blank-aggregate-{label}"),
+                    &observations,
+                )
+                .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("blank-pending-{label}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+                for ticket in [&pending, &completed] {
+                    corrupt_bindings(&fixture, ticket, bindings.clone()).await;
+                    let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                    assert!(matches!(
+                        committed_begin(&fixture, &ticket.attempt_id).await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingShape
+                        ))
+                    ));
+                    assert!(matches!(
+                        committed_finish(
+                            &fixture,
+                            ticket,
+                            "changed-aggregate",
+                            &[changed_observation(&source.source_id)],
+                        )
+                        .await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingShape
+                        ))
+                    ));
+                    assert_eq!(
+                        attempt_identity(&fixture, &ticket.attempt_id).await,
+                        identity_before
+                    );
+                }
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised blank binding case");
+}
+
+#[tokio::test]
+async fn stored_binding_extra_field_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "extra-source", "extra-allocation");
+            register(&fixture, &source, "extra-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "extra-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "extra-evidence",
+                "extra-coverage",
+            )];
+            complete(&fixture, &completed, "extra-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "extra-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            let mut object = serde_json::to_value(&source)
+                .expect("serialize binding")
+                .as_object()
+                .expect("binding serializes to object")
+                .clone();
+            object.insert("unknown_field".into(), serde_json::json!("unexpected"));
+            let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, bindings.clone()).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised extra binding field case");
+}
+
+#[tokio::test]
+async fn stored_foreign_beneficiary_binding_is_ownership_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "foreign-source", "foreign-allocation");
+            register(&fixture, &source, "foreign-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "foreign-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "foreign-evidence",
+                "foreign-coverage",
+            )];
+            complete(&fixture, &completed, "foreign-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "foreign-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            let mut foreign = source.clone();
+            foreign.beneficiary_id = unrelated.beneficiary_id.clone();
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, serde_json::json!([foreign.clone()])).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingOwnership
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingOwnership
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised foreign binding case");
+}
+
+#[tokio::test]
+async fn stored_blank_beneficiary_binding_is_ownership_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "blank-owner-source", "blank-owner-allocation");
+            register(&fixture, &source, "blank-owner-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "blank-owner-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "blank-owner-evidence",
+                "blank-owner-coverage",
+            )];
+            complete(&fixture, &completed, "blank-owner-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "blank-owner-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            let mut blanked = source.clone();
+            blanked.beneficiary_id = String::new();
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, serde_json::json!([blanked.clone()])).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingOwnership
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingOwnership
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised blank beneficiary case");
+}
+
+#[tokio::test]
+async fn stored_duplicate_source_binding_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "duplicate-source", "duplicate-allocation");
+            register(&fixture, &source, "duplicate-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "duplicate-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "duplicate-evidence",
+                "duplicate-coverage",
+            )];
+            complete(&fixture, &completed, "duplicate-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "duplicate-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            let duplicated = serde_json::json!([source.clone(), source.clone()]);
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, duplicated.clone()).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&ticket.source_bindings[0].source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised duplicate binding case");
+}
+
+#[tokio::test]
+async fn stored_duplicate_allocation_binding_is_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "allocation-source", "shared-allocation");
+            register(&fixture, &source, "allocation-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "allocation-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "allocation-evidence",
+                "allocation-coverage",
+            )];
+            complete(&fixture, &completed, "allocation-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "allocation-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            let mut second = source.clone();
+            second.source_id = format!("{}-zzz", source.source_id);
+            let duplicated = serde_json::json!([source, second]);
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, duplicated.clone()).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&ticket.source_bindings[0].source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised duplicate allocation case");
+}
+
+#[tokio::test]
+async fn stored_unordered_bindings_are_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (first, second) = register_pair(&fixture, "unordered").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "unordered-completed")).await;
+            let observations = vec![
+                complete_observation(
+                    &first.source_id,
+                    "unordered-evidence-a",
+                    "unordered-coverage-a",
+                ),
+                complete_observation(
+                    &second.source_id,
+                    "unordered-evidence-b",
+                    "unordered-coverage-b",
+                ),
+            ];
+            complete(&fixture, &completed, "unordered-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "unordered-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            let swapped = serde_json::json!([second, first]);
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, swapped.clone()).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&ticket.source_bindings[0].source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised unordered bindings case");
+}
+
+#[tokio::test]
+async fn stored_changed_binding_field_is_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "changed-source", "changed-allocation");
+            register(&fixture, &source, "changed-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "changed-evidence",
+                "changed-coverage",
+            )];
+            let stored = serde_json::to_value(&source).expect("serialize binding");
+            for (label, field, value) in [
+                ("source", "source_id", "changed-source-id"),
+                ("namespace", "provider_namespace", "changed-namespace"),
+                (
+                    "allocation",
+                    "external_allocation_reference",
+                    "changed-allocation-reference",
+                ),
+            ] {
+                let mut object = stored
+                    .as_object()
+                    .expect("binding serializes to object")
+                    .clone();
+                object.insert(field.into(), serde_json::json!(value));
+                let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
+                let completed = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("changed-completed-{label}")),
+                )
+                .await;
+                complete(
+                    &fixture,
+                    &completed,
+                    &format!("changed-aggregate-{label}"),
+                    &observations,
+                )
+                .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("changed-pending-{label}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+                for ticket in [&pending, &completed] {
+                    corrupt_bindings(&fixture, ticket, bindings.clone()).await;
+                    let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                    assert!(matches!(
+                        committed_begin(&fixture, &ticket.attempt_id).await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingSourceSet
+                        ))
+                    ));
+                    assert!(matches!(
+                        committed_finish(
+                            &fixture,
+                            ticket,
+                            "changed-aggregate",
+                            &[changed_observation(&source.source_id)],
+                        )
+                        .await,
+                        Err(ReconciliationError::CorruptAttempt(
+                            CorruptAttemptReason::BindingSourceSet
+                        ))
+                    ));
+                    assert_eq!(
+                        attempt_identity(&fixture, &ticket.attempt_id).await,
+                        identity_before
+                    );
+                }
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised changed binding case");
+}
+
+#[tokio::test]
+async fn stored_missing_binding_is_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (first, second) = register_pair(&fixture, "omitted").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "omitted-completed")).await;
+            let observations = vec![
+                complete_observation(&first.source_id, "omitted-evidence-a", "omitted-coverage-a"),
+                complete_observation(
+                    &second.source_id,
+                    "omitted-evidence-b",
+                    "omitted-coverage-b",
+                ),
+            ];
+            complete(&fixture, &completed, "omitted-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "omitted-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            let partial = serde_json::json!([first]);
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, partial.clone()).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&second.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised missing binding case");
+}
+
+#[tokio::test]
+async fn stored_extra_binding_is_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "added-source", "added-allocation");
+            register(&fixture, &source, "added-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "added-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "added-evidence",
+                "added-coverage",
+            )];
+            complete(&fixture, &completed, "added-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "added-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            let extra = SourceBinding {
+                beneficiary_id: fixture.beneficiary_id.clone(),
+                source_id: format!("{}-zzz", source.source_id),
+                provider_namespace: format!("stripe:test:{}:extra", fixture.beneficiary_id),
+                external_allocation_reference: "added-extra-allocation".into(),
+                ownership_evidence_reference: "evidence:added-extra-allocation".into(),
+            };
+            let extended = serde_json::json!([source, extra]);
+            for ticket in [&pending, &completed] {
+                corrupt_bindings(&fixture, ticket, extended.clone()).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&ticket.source_bindings[0].source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised extra binding case");
+}
+
+#[tokio::test]
+async fn stored_bindings_reject_non_array_json_at_the_database() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "raw-source", "raw-allocation");
+            register(&fixture, &source, "raw-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "raw-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "raw-evidence",
+                "raw-coverage",
+            )];
+            complete(&fixture, &completed, "raw-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "raw-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            for ticket in [&pending, &completed] {
+                let bindings_before = stored_bindings_text(&fixture, ticket).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                let object = try_set_bindings(&fixture, ticket, r#"{"not":"array"}"#)
+                    .await
+                    .expect_err("non-array bindings must be rejected");
+                assert_sqlstate(&object, "23514");
+                let malformed = try_set_bindings(&fixture, ticket, "not json{{")
+                    .await
+                    .expect_err("malformed bindings must be rejected");
+                assert_sqlstate(&malformed, "22P02");
+                assert_eq!(
+                    stored_bindings_text(&fixture, ticket).await,
+                    bindings_before
+                );
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised raw bindings case");
+}
+
+#[tokio::test]
+async fn deleted_authoritative_sources_are_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "absent-source", "absent-allocation");
+            register(&fixture, &source, "absent-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "absent-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "absent-evidence",
+                "absent-coverage",
+            )];
+            complete(&fixture, &completed, "absent-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "absent-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+                .bind(&fixture.beneficiary_id)
+                .execute(&fixture.pool)
+                .await
+                .expect("delete authoritative sources");
+            for ticket in [&pending, &completed] {
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised absent sources case");
+}
+
+#[tokio::test]
+async fn changed_authoritative_source_is_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "drifted-source", "drifted-allocation");
+            register(&fixture, &source, "drifted-registration").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "drifted-completed")).await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "drifted-evidence",
+                "drifted-coverage",
+            )];
+            complete(&fixture, &completed, "drifted-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "drifted-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            sqlx::query(
+                "UPDATE cloud_coverage_sources SET ownership_evidence_reference = $2 \
+                 WHERE source_id = $1",
+            )
+            .bind(&source.source_id)
+            .bind("tampered-ownership-evidence")
+            .execute(&fixture.pool)
+            .await
+            .expect("change authoritative source");
+            for ticket in [&pending, &completed] {
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                let operations_before = registration_operations(&fixture).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+                assert_eq!(registration_operations(&fixture).await, operations_before);
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised drifted source case");
+}
+
+#[tokio::test]
+async fn partial_authoritative_sources_are_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (first, second) = register_pair(&fixture, "partial").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "partial-completed")).await;
+            let observations = vec![
+                complete_observation(&first.source_id, "partial-evidence-a", "partial-coverage-a"),
+                complete_observation(
+                    &second.source_id,
+                    "partial-evidence-b",
+                    "partial-coverage-b",
+                ),
+            ];
+            complete(&fixture, &completed, "partial-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "partial-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            sqlx::query("DELETE FROM cloud_coverage_sources WHERE source_id = $1")
+                .bind(&second.source_id)
+                .execute(&fixture.pool)
+                .await
+                .expect("delete one authoritative source");
+            for ticket in [&pending, &completed] {
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&first.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised partial sources case");
+}
+
+#[tokio::test]
+async fn lowered_stored_generation_is_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (first, second) = register_pair(&fixture, "lowered").await;
+            let completed = begin(&fixture, &attempt_id(&fixture, "lowered-completed")).await;
+            let observations = vec![
+                complete_observation(&first.source_id, "lowered-evidence-a", "lowered-coverage-a"),
+                complete_observation(
+                    &second.source_id,
+                    "lowered-evidence-b",
+                    "lowered-coverage-b",
+                ),
+            ];
+            complete(&fixture, &completed, "lowered-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "lowered-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
+            for ticket in [&pending, &completed] {
+                corrupt_generation(&fixture, ticket, ticket.source_set_generation - 1).await;
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                let operations_before = registration_operations(&fixture).await;
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&first.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingSourceSet
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+                assert_eq!(registration_operations(&fixture).await, operations_before);
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised lowered generation case");
+}
+
+#[tokio::test]
+async fn completed_attempt_missing_receipt_evidence_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-evidence").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(_), Some(result_json), Some(revision)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error =
+                try_set_receipt(&fixture, &ticket, None, Some(result_json), Some(*revision))
+                    .await
+                    .expect_err("missing receipt evidence must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_missing_receipt_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-result").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(evidence), Some(_), Some(revision)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, Some(evidence), None, Some(*revision))
+                .await
+                .expect_err("missing receipt result must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_missing_receipt_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-revision").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(evidence), Some(result_json), Some(_)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, Some(evidence), Some(result_json), None)
+                .await
+                .expect_err("missing receipt revision must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_missing_full_receipt_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-absent").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, None, None, None)
+                .await
+                .expect_err("absent receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_keeping_only_receipt_evidence_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-only-evidence").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(evidence), Some(_), Some(_)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, Some(evidence), None, None)
+                .await
+                .expect_err("evidence-only receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_keeping_only_receipt_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-only-result").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(_), Some(result_json), Some(_)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, None, Some(result_json), None)
+                .await
+                .expect_err("result-only receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_keeping_only_receipt_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-only-revision").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(_), Some(_), Some(revision)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, None, None, Some(*revision))
+                .await
+                .expect_err("revision-only receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_only_receipt_evidence_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, Some("combo-evidence"), None, None)
+                .await
+                .expect_err("evidence-only pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_only_receipt_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                None,
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                None,
+            )
+            .await
+            .expect_err("result-only pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_only_receipt_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, None, None, Some(revision))
+                .await
+                .expect_err("revision-only pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_receipt_evidence_and_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                None,
+            )
+            .await
+            .expect_err("evidence-and-result pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_receipt_evidence_and_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                None,
+                Some(revision),
+            )
+            .await
+            .expect_err("evidence-and-revision pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_receipt_result_and_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                None,
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                Some(revision),
+            )
+            .await
+            .expect_err("result-and-revision pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_full_receipt_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                Some(revision),
+            )
+            .await
+            .expect_err("full pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_only_receipt_evidence_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, Some("combo-evidence"), None, None)
+                .await
+                .expect_err("evidence-only superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_only_receipt_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                None,
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                None,
+            )
+            .await
+            .expect_err("result-only superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_only_receipt_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, None, None, Some(revision))
+                .await
+                .expect_err("revision-only superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_receipt_evidence_and_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                None,
+            )
+            .await
+            .expect_err("evidence-and-result superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_receipt_evidence_and_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                None,
+                Some(revision),
+            )
+            .await
+            .expect_err("evidence-and-revision superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_receipt_result_and_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                None,
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                Some(revision),
+            )
+            .await
+            .expect_err("result-and-revision superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_full_receipt_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                Some(revision),
+            )
+            .await
+            .expect_err("full superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn stored_result_rejects_non_object_json_at_the_database() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "raw-result").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            for (raw, code) in [
+                ("[]", "23514"),
+                ("\"result\"", "23514"),
+                ("not json{{", "22P02"),
+            ] {
+                let error = match try_set_result(&fixture, &ticket, raw).await {
+                    Err(error) => error,
+                    Ok(()) => panic!("result {raw} must be rejected"),
+                };
+                assert_sqlstate(&error, code);
+            }
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised raw result case");
+}
+
+#[tokio::test]
+async fn stored_revision_rejects_non_positive_values_at_the_database() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "raw-revision").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            for revision in [0, -1] {
+                let error = match try_set_revision(&fixture, &ticket, revision).await {
+                    Err(error) => error,
+                    Ok(()) => panic!("revision {revision} must be rejected"),
+                };
+                assert_sqlstate(&error, "23514");
+            }
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised raw revision case");
+}
+
+#[tokio::test]
+async fn stored_evidence_rejects_blank_values_at_the_database() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "raw-evidence").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            for blank in ["", "  "] {
+                let error = match try_set_evidence(&fixture, &ticket, Some(blank)).await {
+                    Err(error) => error,
+                    Ok(()) => panic!("blank evidence must be rejected"),
+                };
+                assert_sqlstate(&error, "23514");
+            }
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised raw evidence case");
+}
+
+#[tokio::test]
+async fn stored_result_missing_aggregate_key_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-keys").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            assert_eq!(control.revision, head_revision(&fixture).await);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored
+                .as_object_mut()
+                .expect("result is an object")
+                .remove("aggregate_evidence_reference");
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result keys case");
+}
+
+#[tokio::test]
+async fn stored_result_missing_sources_key_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-sources-key").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored
+                .as_object_mut()
+                .expect("result is an object")
+                .remove("sources");
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result keys case");
+}
+
+#[tokio::test]
+async fn stored_result_extra_key_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-extra-key").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored
+                .as_object_mut()
+                .expect("result is an object")
+                .insert("unknown_key".into(), serde_json::json!("unexpected"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result keys case");
+}
+
+#[tokio::test]
+async fn stored_result_blank_evidence_is_evidence_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-blank-evidence").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored.as_object_mut().expect("result is an object").insert(
+                "aggregate_evidence_reference".into(),
+                serde_json::json!("  "),
+            );
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result evidence case");
+}
+
+#[tokio::test]
+async fn stored_result_mismatched_evidence_is_evidence_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-mismatch").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored.as_object_mut().expect("result is an object").insert(
+                "aggregate_evidence_reference".into(),
+                serde_json::json!("different-aggregate"),
+            );
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result evidence case");
+}
+
+#[tokio::test]
+async fn stored_result_non_array_sources_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "result-sources-source",
+                "result-sources-allocation",
+            );
+            register(&fixture, &source, "result-sources-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "result-sources-evidence",
+                "result-sources-coverage",
+            )];
+            for (label, sources) in [
+                ("object", serde_json::json!({})),
+                ("string", serde_json::json!("sources")),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("result-sources-{label}")),
+                )
+                .await;
+                let evidence = format!("result-sources-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                stored
+                    .as_object_mut()
+                    .expect("result is an object")
+                    .insert("sources".into(), sources);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result sources case");
+}
+
+#[tokio::test]
+async fn stored_observation_missing_evidence_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "observation-evidence").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .remove("evidence_reference");
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised observation case");
+}
+
+#[tokio::test]
+async fn stored_observation_extra_field_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "observation-extra").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("unknown_field".into(), serde_json::json!("unexpected"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised observation case");
+}
+
+#[tokio::test]
+async fn stored_observation_unsupported_status_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "observation-status").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("status".into(), serde_json::json!("partial"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised observation case");
+}
+
+#[tokio::test]
+async fn stored_observation_unsupported_reason_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "observation-reason-source",
+                "observation-reason-allocation",
+            );
+            register(&fixture, &source, "observation-reason-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "observation-reason-evidence",
+                "observation-reason-coverage",
+            )];
+            for (label, reason) in [
+                ("text", serde_json::json!("other")),
+                ("number", serde_json::json!(42)),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("observation-reason-{label}")),
+                )
+                .await;
+                let evidence = format!("observation-reason-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                let observation = stored["sources"][0]
+                    .as_object_mut()
+                    .expect("observation is an object");
+                observation.insert("status".into(), serde_json::json!("unavailable"));
+                observation.remove("paid_intervals");
+                observation.insert("reason".into(), reason);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised observation case");
+}
+
+#[tokio::test]
+async fn stored_interval_missing_field_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "interval-field").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]["paid_intervals"][0]
+                .as_object_mut()
+                .expect("interval is an object")
+                .remove("paid_until");
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised interval case");
+}
+
+#[tokio::test]
+async fn stored_interval_wrong_field_type_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "interval-type-source", "interval-type-allocation");
+            register(&fixture, &source, "interval-type-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "interval-type-evidence",
+                "interval-type-coverage",
+            )];
+            for (label, field, value) in [
+                ("string", "starts_at", serde_json::json!("soon")),
+                ("float", "paid_until", serde_json::json!(1.5)),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("interval-type-{label}")),
+                )
+                .await;
+                let evidence = format!("interval-type-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                stored["sources"][0]["paid_intervals"][0]
+                    .as_object_mut()
+                    .expect("interval is an object")
+                    .insert(field.into(), value);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised interval case");
+}
+
+#[tokio::test]
+async fn stored_interval_extra_field_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "interval-extra").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]["paid_intervals"][0]
+                .as_object_mut()
+                .expect("interval is an object")
+                .insert("unknown_field".into(), serde_json::json!("unexpected"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised interval case");
+}
+
+#[tokio::test]
+async fn stored_interval_renewal_wrong_type_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "interval-renewal-source",
+                "interval-renewal-allocation",
+            );
+            register(&fixture, &source, "interval-renewal-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "interval-renewal-evidence",
+                "interval-renewal-coverage",
+            )];
+            for (label, value) in [
+                ("number", serde_json::json!(42)),
+                ("boolean", serde_json::json!(false)),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("interval-renewal-{label}")),
+                )
+                .await;
+                let evidence = format!("interval-renewal-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                stored["sources"][0]["paid_intervals"][0]
+                    .as_object_mut()
+                    .expect("interval is an object")
+                    .insert("failed_renewal_id".into(), value);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised interval case");
+}
+
+#[tokio::test]
+async fn stored_duplicate_observations_are_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "duplicate-observations").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            let sources = stored["sources"]
+                .as_array_mut()
+                .expect("sources is an array");
+            sources.push(sources[0].clone());
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_missing_observation_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, first, _) =
+                setup_completed_pair(&fixture, "missing-observation").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"]
+                .as_array_mut()
+                .expect("sources is an array")
+                .remove(1);
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&first.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_extra_observation_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, first, _) =
+                setup_completed_pair(&fixture, "extra-observation").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            let sources = stored["sources"]
+                .as_array_mut()
+                .expect("sources is an array");
+            sources.push(sources[0].clone());
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&first.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_foreign_observation_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "foreign-observation").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("source_id".into(), serde_json::json!("foreign-source"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_misattributed_fact_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "misattributed-fact").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]["paid_intervals"][0]
+                .as_object_mut()
+                .expect("interval is an object")
+                .insert("source_id".into(), serde_json::json!("other-source"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_unordered_observations_are_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, first, _) =
+                setup_completed_pair(&fixture, "unordered-observations").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"]
+                .as_array_mut()
+                .expect("sources is an array")
+                .swap(0, 1);
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&first.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_unordered_intervals_are_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "intervals-source", "intervals-allocation");
+            register(&fixture, &source, "intervals-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "intervals-attempt")).await;
+            let observations = vec![SourceObservation::Complete {
+                source_id: source.source_id.clone(),
+                evidence_reference: "intervals-evidence".into(),
+                paid_intervals: vec![
+                    ConfirmedPaidInterval {
+                        coverage_id: "intervals-b".into(),
+                        source_id: source.source_id.clone(),
+                        starts_at: 100,
+                        paid_until: 200,
+                        failed_renewal_id: None,
+                    },
+                    ConfirmedPaidInterval {
+                        coverage_id: "intervals-a".into(),
+                        source_id: source.source_id.clone(),
+                        starts_at: 0,
+                        paid_until: 100,
+                        failed_renewal_id: None,
+                    },
+                ],
+            }];
+            complete(&fixture, &ticket, "intervals-aggregate", &observations).await;
+            let control = committed_finish(&fixture, &ticket, "intervals-aggregate", &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            let intervals = stored["sources"][0]["paid_intervals"]
+                .as_array_mut()
+                .expect("intervals is an array");
+            assert_eq!(intervals.len(), 2);
+            assert_eq!(
+                intervals[0]["coverage_id"],
+                serde_json::json!("intervals-a")
+            );
+            intervals.swap(0, 1);
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_invalid_interval_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "invalid-interval-source",
+                "invalid-interval-allocation",
+            );
+            register(&fixture, &source, "invalid-interval-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "invalid-interval-evidence",
+                "invalid-interval-coverage",
+            )];
+            for (label, field, value) in [
+                ("bounds", "paid_until", serde_json::json!(0)),
+                ("coverage", "coverage_id", serde_json::json!("")),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("invalid-interval-{label}")),
+                )
+                .await;
+                let evidence = format!("invalid-interval-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                stored["sources"][0]["paid_intervals"][0]
+                    .as_object_mut()
+                    .expect("interval is an object")
+                    .insert(field.into(), value);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultCanonical
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultCanonical
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_blank_observation_evidence_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "blank-observation").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("evidence_reference".into(), serde_json::json!("  "));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_blank_observation_source_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "blank-observation-source").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("source_id".into(), serde_json::json!(""));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn binding_shape_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let source = binding(&fixture, "read-only-source", "read-only-allocation");
+            register(&fixture, &source, "read-only-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "read-only-attempt")).await;
+            corrupt_bindings(&fixture, &ticket, serde_json::json!([])).await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingShape
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            assert_eq!(stored_bindings_text(&fixture, &ticket).await, "[]");
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn binding_ownership_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let source = binding(&fixture, "ownership-source", "ownership-allocation");
+            register(&fixture, &source, "ownership-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "ownership-attempt")).await;
+            let mut foreign = source.clone();
+            foreign.beneficiary_id = unrelated.beneficiary_id.clone();
+            corrupt_bindings(&fixture, &ticket, serde_json::json!([foreign.clone()])).await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingOwnership
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            let stored: serde_json::Value =
+                serde_json::from_str(&stored_bindings_text(&fixture, &ticket).await)
+                    .expect("parse stored bindings");
+            assert_eq!(stored, serde_json::json!([foreign]));
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn binding_source_set_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let source = binding(&fixture, "source-set-source", "source-set-allocation");
+            register(&fixture, &source, "source-set-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "source-set-attempt")).await;
+            sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+                .bind(&fixture.beneficiary_id)
+                .execute(&fixture.pool)
+                .await
+                .expect("delete authoritative sources");
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingSourceSet
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            assert!(registration_operations(&fixture).await.is_empty());
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await.4,
+                "pending"
+            );
+            assert_eq!(head_revision(&fixture).await, head_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn receipt_combination_rejection_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "receipt-read-only").await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            let mut tx = fixture
+                .pool
+                .begin()
+                .await
+                .expect("begin rejected receipt write");
+            let update = sqlx::query(
+                "UPDATE cloud_coverage_collection_attempts \
+                 SET aggregate_evidence_reference = NULL \
+                 WHERE beneficiary_id = $1 AND attempt_id = $2",
+            )
+            .bind(&fixture.beneficiary_id)
+            .bind(&ticket.attempt_id)
+            .execute(&mut *tx)
+            .await;
+            let error = match update {
+                Err(error) => error,
+                Ok(_) => panic!("receipt combination must be rejected"),
+            };
+            assert_sqlstate(&error, "23514");
+            tx.rollback()
+                .await
+                .expect("rollback rejected receipt write");
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                (
+                    fixture_before.attempts[0].6.clone(),
+                    fixture_before.attempts[0].7.clone(),
+                    fixture_before.attempts[0].8,
+                )
+            );
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn result_shape_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let (ticket, _, _, source) = setup_completed_attempt(&fixture, "shape-read-only").await;
+            let mut mutated = stored_result_json(&fixture, &ticket).await;
+            mutated
+                .as_object_mut()
+                .expect("result is an object")
+                .remove("sources");
+            let mutated_text = mutated.to_string();
+            try_set_result(&fixture, &ticket, &mutated_text)
+                .await
+                .expect("store mutated result");
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            let stored: serde_json::Value = serde_json::from_str(
+                &read_receipt_columns(&fixture, &ticket)
+                    .await
+                    .1
+                    .expect("mutated result is available"),
+            )
+            .expect("parse stored result");
+            assert_eq!(stored, mutated);
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn result_evidence_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let (ticket, _, _, source) =
+                setup_completed_attempt(&fixture, "evidence-read-only").await;
+            let mut mutated = stored_result_json(&fixture, &ticket).await;
+            mutated
+                .as_object_mut()
+                .expect("result is an object")
+                .insert(
+                    "aggregate_evidence_reference".into(),
+                    serde_json::json!("different-aggregate"),
+                );
+            let mutated_text = mutated.to_string();
+            try_set_result(&fixture, &ticket, &mutated_text)
+                .await
+                .expect("store mutated result");
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            let stored: serde_json::Value = serde_json::from_str(
+                &read_receipt_columns(&fixture, &ticket)
+                    .await
+                    .1
+                    .expect("mutated result is available"),
+            )
+            .expect("parse stored result");
+            assert_eq!(stored, mutated);
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn canonical_form_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let (ticket, _, _, source) =
+                setup_completed_attempt(&fixture, "canonical-read-only").await;
+            let mut mutated = stored_result_json(&fixture, &ticket).await;
+            let sources = mutated["sources"]
+                .as_array_mut()
+                .expect("sources is an array");
+            sources.push(sources[0].clone());
+            let mutated_text = mutated.to_string();
+            try_set_result(&fixture, &ticket, &mutated_text)
+                .await
+                .expect("store mutated result");
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            let stored: serde_json::Value = serde_json::from_str(
+                &read_receipt_columns(&fixture, &ticket)
+                    .await
+                    .1
+                    .expect("mutated result is available"),
+            )
+            .expect("parse stored result");
+            assert_eq!(stored, mutated);
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn database_failure_rolls_back_without_corruption_classification() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "database-source", "database-allocation");
+            register(&fixture, &source, "database-registration").await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            let unknown_beneficiary = format!("coverage-reconciliation-test-{}", Uuid::new_v4());
+            let unknown = SourceBinding {
+                beneficiary_id: unknown_beneficiary.clone(),
+                source_id: format!("{unknown_beneficiary}:database-source"),
+                provider_namespace: format!("stripe:test:{unknown_beneficiary}"),
+                external_allocation_reference: "database-allocation".into(),
+                ownership_evidence_reference: "evidence:database-allocation".into(),
+            };
+            let mut tx = fixture
+                .pool
+                .begin()
+                .await
+                .expect("begin failing registration");
+            let result = register_source(&mut tx, "database-operation", &unknown).await;
+            match result {
+                Err(ReconciliationError::Database(error)) => assert_sqlstate(&error, "23503"),
+                other => panic!("expected database error, got {other:?}"),
+            }
+            tx.rollback().await.expect("rollback failing registration");
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised database failure case");
+    assert_no_beneficiary_rows(&fixture).await;
+    assert_no_beneficiary_rows(&unrelated).await;
+    assert!(!user_present(&fixture).await);
+    assert!(!user_present(&unrelated).await);
+}
+
+#[tokio::test]
+async fn historical_replay_returns_stored_receipt_after_later_registration() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let first = binding(&fixture, "historical-first", "historical-allocation-first");
+            register(&fixture, &first, "historical-first-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "historical-attempt")).await;
+            let observations = vec![complete_observation(
+                &first.source_id,
+                "historical-evidence",
+                "historical-coverage",
+            )];
+            let completed =
+                complete(&fixture, &ticket, "historical-aggregate", &observations).await;
+            assert_eq!(completed.revision, 2);
+            let second = binding(
+                &fixture,
+                "historical-second",
+                "historical-allocation-second",
+            );
+            register(&fixture, &second, "historical-second-registration").await;
+            assert_eq!(coordinator_generation(&fixture).await, 2);
+            assert_eq!(head_revision(&fixture).await, 3);
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+
+            let replayed =
+                committed_finish(&fixture, &ticket, "historical-aggregate", &observations).await;
+            let replayed = replayed.expect("replay historical completion");
+            assert_eq!(replayed.outcome, PublicationOutcome::AlreadyApplied);
+            assert_eq!(replayed.revision, completed.revision);
+            let ticket_replay = committed_begin(&fixture, &ticket.attempt_id)
+                .await
+                .expect("replay historical ticket");
+            assert_eq!(ticket_replay.completed_revision, Some(completed.revision));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(head_revision(&fixture).await, 3);
+            assert_eq!(coordinator_generation(&fixture).await, 2);
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised historical replay case");
+    assert_no_beneficiary_rows(&fixture).await;
+    assert_no_beneficiary_rows(&unrelated).await;
+    assert!(!user_present(&fixture).await);
+    assert!(!user_present(&unrelated).await);
+}
+
+#[tokio::test]
+async fn historical_replay_with_changed_arguments_is_an_operation_conflict() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let first = binding(&fixture, "historical-first", "historical-allocation-first");
+            register(&fixture, &first, "historical-first-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "historical-attempt")).await;
+            let observations = vec![complete_observation(
+                &first.source_id,
+                "historical-evidence",
+                "historical-coverage",
+            )];
+            complete(&fixture, &ticket, "historical-aggregate", &observations).await;
+            let second = binding(
+                &fixture,
+                "historical-second",
+                "historical-allocation-second",
+            );
+            register(&fixture, &second, "historical-second-registration").await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&first.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::OperationConflict)
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(head_revision(&fixture).await, 3);
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised historical conflict case");
+    assert_no_beneficiary_rows(&fixture).await;
+    assert_no_beneficiary_rows(&unrelated).await;
+    assert!(!user_present(&fixture).await);
+    assert!(!user_present(&unrelated).await);
+}
+
+#[tokio::test]
+async fn tampered_historical_generation_is_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let first = binding(&fixture, "historical-first", "historical-allocation-first");
+            register(&fixture, &first, "historical-first-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "historical-attempt")).await;
+            let observations = vec![complete_observation(
+                &first.source_id,
+                "historical-evidence",
+                "historical-coverage",
+            )];
+            complete(&fixture, &ticket, "historical-aggregate", &observations).await;
+            let second = binding(
+                &fixture,
+                "historical-second",
+                "historical-allocation-second",
+            );
+            register(&fixture, &second, "historical-second-registration").await;
+
+            corrupt_generation(&fixture, &ticket, 2).await;
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+
+            assert!(matches!(
+                committed_finish(&fixture, &ticket, "historical-aggregate", &observations).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingSourceSet
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingSourceSet
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(head_revision(&fixture).await, 3);
+            assert_eq!(coordinator_generation(&fixture).await, 2);
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised tampered generation case");
+    assert_no_beneficiary_rows(&fixture).await;
+    assert_no_beneficiary_rows(&unrelated).await;
+    assert!(!user_present(&fixture).await);
+    assert!(!user_present(&unrelated).await);
 }
 
 #[tokio::test]
