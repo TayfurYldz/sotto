@@ -400,7 +400,7 @@ export function VaultView({
               </p>
             )}
             <ul className="items">
-            {projects.map((p) => (
+            {(projects ?? []).map((p) => (
               <li key={p.project.id}>
                 <button
                   onClick={() => void selectProject(p)}
